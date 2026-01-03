@@ -1,0 +1,462 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  Serverless REST API with Lambda, API Gateway, and DynamoDB.
+  Demonstrates SAM template syntax and serverless architecture patterns.
+
+# ============================================================================
+# GLOBALS
+# ============================================================================
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref ItemsTable
+        LOG_LEVEL: INFO
+    Tags:
+      Application: ServerlessAPI
+
+  Api:
+    Cors:
+      AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+      AllowHeaders: "'Content-Type,Authorization'"
+      AllowOrigin: "'*'"
+
+# ============================================================================
+# PARAMETERS
+# ============================================================================
+Parameters:
+  Environment:
+    Description: Environment name
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  ApiStageName:
+    Description: API Gateway stage name
+    Type: String
+    Default: v1
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+  # --------------------------------------------------------------------------
+  # DynamoDB Table
+  # --------------------------------------------------------------------------
+  ItemsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${Environment}-items
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: category
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: category-created_at-index
+          KeySchema:
+            - AttributeName: category
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # --------------------------------------------------------------------------
+  # Lambda Functions
+  # --------------------------------------------------------------------------
+  CreateItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-create-item
+      Handler: index.create_handler
+      Description: Create a new item
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ItemsTable
+      Events:
+        CreateItem:
+          Type: Api
+          Properties:
+            Path: /items
+            Method: POST
+            RestApiId: !Ref ApiGateway
+      InlineCode: |
+        import json
+        import os
+        import uuid
+        import logging
+        from datetime import datetime
+        from decimal import Decimal
+        import boto3
+
+        logger = logging.getLogger()
+        logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+        dynamodb = boto3.resource('dynamodb')
+        table = dynamodb.Table(os.environ['TABLE_NAME'])
+
+        def create_handler(event, context):
+            logger.info(f"Create item request: {json.dumps(event)}")
+
+            try:
+                body = json.loads(event.get('body', '{}'))
+
+                if not body.get('name'):
+                    return response(400, {'error': 'Name is required'})
+
+                item = {
+                    'id': str(uuid.uuid4()),
+                    'name': body['name'],
+                    'description': body.get('description', ''),
+                    'category': body.get('category', 'general'),
+                    'price': Decimal(str(body.get('price', 0))),
+                    'created_at': datetime.utcnow().isoformat(),
+                    'updated_at': datetime.utcnow().isoformat()
+                }
+
+                table.put_item(Item=item)
+                logger.info(f"Created item: {item['id']}")
+
+                return response(201, serialize(item))
+
+            except json.JSONDecodeError:
+                return response(400, {'error': 'Invalid JSON'})
+            except Exception as e:
+                logger.exception("Error creating item")
+                return response(500, {'error': str(e)})
+
+        def response(status_code, body):
+            return {
+                'statusCode': status_code,
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                'body': json.dumps(body, default=str)
+            }
+
+        def serialize(item):
+            return {k: float(v) if isinstance(v, Decimal) else v for k, v in item.items()}
+
+  GetItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-get-item
+      Handler: index.get_handler
+      Description: Get a single item by ID
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ItemsTable
+      Events:
+        GetItem:
+          Type: Api
+          Properties:
+            Path: /items/{id}
+            Method: GET
+            RestApiId: !Ref ApiGateway
+      InlineCode: |
+        import json
+        import os
+        import logging
+        from decimal import Decimal
+        import boto3
+
+        logger = logging.getLogger()
+        logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+        dynamodb = boto3.resource('dynamodb')
+        table = dynamodb.Table(os.environ['TABLE_NAME'])
+
+        def get_handler(event, context):
+            item_id = event['pathParameters']['id']
+            logger.info(f"Get item request: {item_id}")
+
+            try:
+                result = table.get_item(Key={'id': item_id})
+                item = result.get('Item')
+
+                if not item:
+                    return response(404, {'error': 'Item not found'})
+
+                return response(200, serialize(item))
+
+            except Exception as e:
+                logger.exception("Error getting item")
+                return response(500, {'error': str(e)})
+
+        def response(status_code, body):
+            return {
+                'statusCode': status_code,
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                'body': json.dumps(body, default=str)
+            }
+
+        def serialize(item):
+            return {k: float(v) if isinstance(v, Decimal) else v for k, v in item.items()}
+
+  ListItemsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-list-items
+      Handler: index.list_handler
+      Description: List all items
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ItemsTable
+      Events:
+        ListItems:
+          Type: Api
+          Properties:
+            Path: /items
+            Method: GET
+            RestApiId: !Ref ApiGateway
+      InlineCode: |
+        import json
+        import os
+        import logging
+        from decimal import Decimal
+        import boto3
+
+        logger = logging.getLogger()
+        logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+        dynamodb = boto3.resource('dynamodb')
+        table = dynamodb.Table(os.environ['TABLE_NAME'])
+
+        def list_handler(event, context):
+            logger.info("List items request")
+
+            try:
+                # Get optional category filter from query parameters
+                params = event.get('queryStringParameters') or {}
+                category = params.get('category')
+
+                if category:
+                    # Query by category using GSI
+                    result = table.query(
+                        IndexName='category-created_at-index',
+                        KeyConditionExpression='category = :cat',
+                        ExpressionAttributeValues={':cat': category}
+                    )
+                else:
+                    # Scan all items
+                    result = table.scan()
+
+                items = result.get('Items', [])
+                logger.info(f"Found {len(items)} items")
+
+                return response(200, {
+                    'items': [serialize(item) for item in items],
+                    'count': len(items)
+                })
+
+            except Exception as e:
+                logger.exception("Error listing items")
+                return response(500, {'error': str(e)})
+
+        def response(status_code, body):
+            return {
+                'statusCode': status_code,
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                'body': json.dumps(body, default=str)
+            }
+
+        def serialize(item):
+            return {k: float(v) if isinstance(v, Decimal) else v for k, v in item.items()}
+
+  DeleteItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-delete-item
+      Handler: index.delete_handler
+      Description: Delete an item by ID
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ItemsTable
+      Events:
+        DeleteItem:
+          Type: Api
+          Properties:
+            Path: /items/{id}
+            Method: DELETE
+            RestApiId: !Ref ApiGateway
+      InlineCode: |
+        import json
+        import os
+        import logging
+        import boto3
+        from botocore.exceptions import ClientError
+
+        logger = logging.getLogger()
+        logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+        dynamodb = boto3.resource('dynamodb')
+        table = dynamodb.Table(os.environ['TABLE_NAME'])
+
+        def delete_handler(event, context):
+            item_id = event['pathParameters']['id']
+            logger.info(f"Delete item request: {item_id}")
+
+            try:
+                table.delete_item(
+                    Key={'id': item_id},
+                    ConditionExpression='attribute_exists(id)'
+                )
+                logger.info(f"Deleted item: {item_id}")
+                return response(204, None)
+
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                    return response(404, {'error': 'Item not found'})
+                raise
+            except Exception as e:
+                logger.exception("Error deleting item")
+                return response(500, {'error': str(e)})
+
+        def response(status_code, body):
+            return {
+                'statusCode': status_code,
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                'body': json.dumps(body) if body else ''
+            }
+
+  # --------------------------------------------------------------------------
+  # API Gateway
+  # --------------------------------------------------------------------------
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub ${Environment}-items-api
+      StageName: !Ref ApiStageName
+      Description: Items REST API
+      EndpointConfiguration:
+        Type: REGIONAL
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+      Tags:
+        Environment: !Ref Environment
+
+  # --------------------------------------------------------------------------
+  # CloudWatch Alarms
+  # --------------------------------------------------------------------------
+  ApiGateway5xxErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-api-5xx-errors
+      AlarmDescription: API Gateway 5xx errors
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub ${Environment}-items-api
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-lambda-errors
+      AlarmDescription: Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CreateItemFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+
+  ApiId:
+    Description: API Gateway ID
+    Value: !Ref ApiGateway
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiId
+
+  TableName:
+    Description: DynamoDB table name
+    Value: !Ref ItemsTable
+    Export:
+      Name: !Sub ${AWS::StackName}-TableName
+
+  CreateFunctionArn:
+    Description: Create function ARN
+    Value: !GetAtt CreateItemFunction.Arn
+
+  GetFunctionArn:
+    Description: Get function ARN
+    Value: !GetAtt GetItemFunction.Arn
+
+  ListFunctionArn:
+    Description: List function ARN
+    Value: !GetAtt ListItemsFunction.Arn
+
+  DeleteFunctionArn:
+    Description: Delete function ARN
+    Value: !GetAtt DeleteItemFunction.Arn
+
+  TestCommands:
+    Description: Example curl commands to test the API
+    Value: !Sub |
+      # Create item
+      curl -X POST ${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/items \
+        -H "Content-Type: application/json" \
+        -d '{"name":"Widget","category":"electronics","price":29.99}'
+
+      # List items
+      curl ${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/items
+
+      # Get item
+      curl ${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/items/{id}
+
+      # Delete item
+      curl -X DELETE ${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/items/{id}
